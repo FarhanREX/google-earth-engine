@@ -1,0 +1,91 @@
+// Initialize the map for visualization
+Map.centerObject(ee.Geometry.Rectangle([73.5, 32, 80, 37]), 7);
+
+// Define the region of interest (Kashmir)
+var kashmir = ee.Geometry.Rectangle([73.5, 32, 80, 37]);
+
+// Step 1: MODIS Landcover for 2020
+var modis_landcover = ee.ImageCollection('MODIS/061/MCD12Q1')
+    .filterBounds(kashmir)
+    .filterDate('2015-01-01', '2024-12-31')
+    .select('LC_Type1');
+
+// Get the MODIS land cover image for 2020
+var modis_2020 = modis_landcover.filterDate('2020-01-01', '2020-12-31').first();
+
+// Step 2: Calculate NDVI using Landsat Data for 2015 and 2024
+function calculateNDVI(image) {
+  var img = ee.Image('MODIS/006/MOD09GA/2012_03_09');
+    var ndvi = img.normalizedDifference(['sur_refl_b02', 'sur_refl_b01']);
+    return image.addBands(ndvi);
+}
+
+// Landsat data for 2015 and 2024
+var landsat_2015 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(kashmir)
+    .filterDate('2015-01-01', '2015-12-31')
+    .map(calculateNDVI)
+    .median();
+
+var landsat_2024 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(kashmir)
+    .filterDate('2024-01-01', '2024-12-31')
+    .map(calculateNDVI)
+    .median();
+
+// Calculate NDVI Change
+var ndvi_change = landsat_2024.select('NDVI').subtract(landsat_2015.select('NDVI')).rename('NDVI_Change');
+
+// Step 3: Prepare Training Data
+// Combine features for prediction: NDVI and other bands from Landsat data
+var combined_features = landsat_2024.addBands(ndvi_change);
+
+// Sample from MODIS land cover
+var training_points = modis_2020.stratifiedSample({
+  numPoints: 200, // Reduce the number of points sampled
+  classBand: 'LC_Type1',
+  region: kashmir,
+  scale: 500,
+  geometries: true
+});
+
+// Filter out valid samples
+var valid_samples = training_points.filter(ee.Filter.notNull(['LC_Type1', 'NDVI']));
+
+// Debugging Information
+print("Training Points:", training_points);
+print("Valid Samples:", valid_samples);
+
+// Train Random Forest model on the valid samples
+if (valid_samples.size().gt(0)) {
+    var classifier = ee.Classifier.smileRandomForest(100).train({
+        features: valid_samples,
+        classProperty: 'LC_Type1',
+        inputProperties: ['NDVI', 'SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7']
+    });
+
+    // Classify Landsat 2024 data based on the trained classifier
+    var predicted_lulc_2024 = combined_features.classify(classifier).clip(kashmir);
+
+    // Visualization parameters for land cover
+    var lulc_vis_params = {
+        min: 1,
+        max: 17,
+        palette: [
+            '05450a', '086a10', '54a708', '78d203', '009900', 'c6b044', 'dcd159',
+            'dade48', 'fbff13', 'b6ff05', '27ff87', 'c24f44', 'a5a5a5', 'ff6d4c',
+            '69fff8', 'f9ffa4', '1c0dff'
+        ]
+    };
+
+    // Add layers to the map
+    Map.addLayer(predicted_lulc_2024, lulc_vis_params, 'Predicted LULC 2024');
+} else {
+    print("No valid training data found.");
+}
+
+// Add NDVI change layer to the map
+Map.addLayer(ndvi_change.clip(kashmir), {min: -1, max: 1, palette: ['red', 'white', 'green']}, "NDVI Change");
+
+// Add the original MODIS 2020 land cover layer for reference, clipped to Kashmir
+Map.addLayer(modis_2020.clip(kashmir), lulc_vis_params, "MODIS Landcover 2020");
